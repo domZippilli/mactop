@@ -13,8 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-
 	"sync"
 
 	"github.com/mattn/go-runewidth"
@@ -62,15 +60,8 @@ func setupUI() {
 	updateModelText()
 	updateHelpText()
 	stderrLogger.Printf("Model: %s\nE-Core Count: %d\nP-Core Count: %d\nS-Core Count: %d\nGPU Core Count: %d", modelName, eCoreCount, pCoreCount, sCoreCount, gpuCoreCount)
-
-	systemInfoGauge.With(prometheus.Labels{
-		"model":          modelName,
-		"core_count":     fmt.Sprintf("%d", eCoreCount+pCoreCount+sCoreCount),
-		"e_core_count":   fmt.Sprintf("%d", eCoreCount),
-		"p_core_count":   fmt.Sprintf("%d", pCoreCount),
-		"s_core_count":   fmt.Sprintf("%d", sCoreCount),
-		"gpu_core_count": fmt.Sprintf("%d", gpuCoreCount),
-	}).Set(1)
+	// mactop_system_info is now set via setSensorGauges (finalizeCPUUI), so the
+	// TUI and headless modes emit it from one place.
 
 	processList = w.NewList()
 	processList.Title = i18n.T("TUI_ProcessList")
@@ -980,8 +971,21 @@ func updateMemoryHistory(memoryMetrics MemoryMetrics) {
 }
 
 func finalizeCPUUI(totalUsage float64, coreUsages []float64, cpuMetrics CPUMetrics, memoryMetrics MemoryMetrics) {
-	ecoreAvg, pcoreAvg, scoreAvg := calculateCoreAverages(coreUsages)
-	updateCPUPrometheusMetrics(totalUsage, ecoreAvg, pcoreAvg, scoreAvg, coreUsages, cpuMetrics, memoryMetrics)
+	// Single per-tick write of the whole mactop_* surface. Runs under
+	// renderMutex (via updateCPUUI), so the buffered lastGPUMetrics / TB / RDMA
+	// reads are safe. GPU/TB values lag by at most one tick, which is invisible
+	// to a Prometheus scraper.
+	setSensorGauges(SensorSnapshot{
+		CPUUsagePercent:     totalUsage,
+		CoreUsages:          coreUsages,
+		CPU:                 cpuMetrics,
+		GPU:                 lastGPUMetrics,
+		Memory:              memoryMetrics,
+		TBNetInBytesPerSec:  lastTBNetInBytesPerSec,
+		TBNetOutBytesPerSec: lastTBNetOutBytesPerSec,
+		RDMAAvailable:       lastRDMAAvailable,
+		System:              cachedSystemInfo,
+	})
 
 	// Update gauge colors with dynamic saturation if 1977 theme is active
 	if currentConfig.Theme == "1977" {
@@ -1087,82 +1091,6 @@ func updateMemoryGaugeTitle(memoryMetrics MemoryMetrics) {
 	}
 }
 
-func calculateCoreAverages(coreUsages []float64) (ecoreAvg, pcoreAvg, scoreAvg float64) {
-	if cpuCoreWidget.eCoreCount > 0 && len(coreUsages) >= cpuCoreWidget.eCoreCount {
-		for i := 0; i < cpuCoreWidget.eCoreCount; i++ {
-			ecoreAvg += coreUsages[i]
-		}
-		ecoreAvg /= float64(cpuCoreWidget.eCoreCount)
-	}
-	pStart := cpuCoreWidget.eCoreCount
-	pEnd := pStart + cpuCoreWidget.pCoreCount
-	if cpuCoreWidget.pCoreCount > 0 && len(coreUsages) >= pEnd {
-		for i := pStart; i < pEnd; i++ {
-			pcoreAvg += coreUsages[i]
-		}
-		pcoreAvg /= float64(cpuCoreWidget.pCoreCount)
-	}
-	sStart := pEnd
-	sEnd := sStart + cpuCoreWidget.sCoreCount
-	if cpuCoreWidget.sCoreCount > 0 && len(coreUsages) >= sEnd {
-		for i := sStart; i < sEnd; i++ {
-			scoreAvg += coreUsages[i]
-		}
-		scoreAvg /= float64(cpuCoreWidget.sCoreCount)
-	}
-	return ecoreAvg, pcoreAvg, scoreAvg
-}
-
-func updateCPUPrometheusMetrics(totalUsage, ecoreAvg, pcoreAvg, scoreAvg float64, coreUsages []float64, cpuMetrics CPUMetrics, memoryMetrics MemoryMetrics) {
-	thermalStateNum := 0
-	switch getThermalStateLevel() {
-	case thermalStateFair:
-		thermalStateNum = 1
-	case thermalStateSerious:
-		thermalStateNum = 2
-	case thermalStateCritical:
-		thermalStateNum = 3
-	}
-
-	cpuUsage.Set(totalUsage)
-	ecoreUsage.Set(ecoreAvg)
-	pcoreUsage.Set(pcoreAvg)
-	scoreUsage.Set(scoreAvg)
-	powerUsage.With(prometheus.Labels{"component": "cpu"}).Set(cpuMetrics.CPUW)
-	powerUsage.With(prometheus.Labels{"component": "gpu"}).Set(cpuMetrics.GPUW)
-	powerUsage.With(prometheus.Labels{"component": "ane"}).Set(cpuMetrics.ANEW)
-	powerUsage.With(prometheus.Labels{"component": "dram"}).Set(cpuMetrics.DRAMW)
-	powerUsage.With(prometheus.Labels{"component": "gpu_sram"}).Set(cpuMetrics.GPUSRAMW)
-	powerUsage.With(prometheus.Labels{"component": "system"}).Set(cpuMetrics.SystemW)
-	powerUsage.With(prometheus.Labels{"component": "total"}).Set(cpuMetrics.PackageW)
-	socTemp.Set(cpuMetrics.CPUTemp)
-	gpuTemp.Set(cpuMetrics.GPUTemp)
-	thermalState.Set(float64(thermalStateNum))
-
-	// DRAM bandwidth
-	dramBandwidth.With(prometheus.Labels{"direction": "read"}).Set(cpuMetrics.DRAMReadBW)
-	dramBandwidth.With(prometheus.Labels{"direction": "write"}).Set(cpuMetrics.DRAMWriteBW)
-	dramBandwidth.With(prometheus.Labels{"direction": "combined"}).Set(cpuMetrics.DRAMBWCombined)
-
-	memoryUsage.With(prometheus.Labels{"type": "used"}).Set(float64(memoryMetrics.Used) / 1024 / 1024 / 1024)
-	memoryUsage.With(prometheus.Labels{"type": "total"}).Set(float64(memoryMetrics.Total) / 1024 / 1024 / 1024)
-	memoryUsage.With(prometheus.Labels{"type": "swap_used"}).Set(float64(memoryMetrics.SwapUsed) / 1024 / 1024 / 1024)
-	memoryUsage.With(prometheus.Labels{"type": "swap_total"}).Set(float64(memoryMetrics.SwapTotal) / 1024 / 1024 / 1024)
-
-	// Update per-core CPU usage metrics
-	eCoreCount := cpuCoreWidget.eCoreCount
-	pEnd := eCoreCount + cpuCoreWidget.pCoreCount
-	for i, usage := range coreUsages {
-		coreType := "s"
-		if i < eCoreCount {
-			coreType = "e"
-		} else if i < pEnd {
-			coreType = "p"
-		}
-		cpuCoreUsage.With(prometheus.Labels{"core": fmt.Sprintf("%d", i), "type": coreType}).Set(usage)
-	}
-}
-
 func updateGPUUI(gpuMetrics GPUMetrics) {
 	if isCompactLayout() {
 		if gpuMetrics.Temp > 0 {
@@ -1225,12 +1153,8 @@ func updateGPUUI(gpuMetrics GPUMetrics) {
 		gpuHistoryChart.Title = fmt.Sprintf(i18n.T("Metrics_GPUHistoryChart"), avgGPU)
 	}
 
-	if gpuMetrics.ActivePercent > 0 {
-		gpuUsage.Set(gpuMetrics.ActivePercent)
-	} else {
-		gpuUsage.Set(0)
-	}
-	gpuFreqMHz.Set(float64(gpuMetrics.FreqMHz))
+	// gpu_usage / gpu_freq gauges are written by setSensorGauges (finalizeCPUUI)
+	// from lastGPUMetrics, so both TUI and headless emit them identically.
 
 	// Update gauge colors with dynamic saturation if 1977 theme is active
 	if currentConfig.Theme == "1977" {
@@ -1396,14 +1320,11 @@ func updateTBNetUI(tbStats []ThunderboltNetStats) {
 		}
 	}
 
-	// Update Prometheus metrics for Thunderbolt network and RDMA
-	tbNetworkSpeed.With(prometheus.Labels{"direction": "download"}).Set(totalBytesIn)
-	tbNetworkSpeed.With(prometheus.Labels{"direction": "upload"}).Set(totalBytesOut)
-	if rdmaStatus.Available {
-		rdmaAvailable.Set(1)
-	} else {
-		rdmaAvailable.Set(0)
-	}
+	// Buffer the latest TB-network/RDMA values for setSensorGauges (finalizeCPUUI).
+	// Runs under renderMutex (see startBackgroundUpdates), same lock the reader holds.
+	lastTBNetInBytesPerSec = totalBytesIn
+	lastTBNetOutBytesPerSec = totalBytesOut
+	lastRDMAAvailable = rdmaStatus.Available
 }
 
 func parseCommandLineFlags() {

@@ -115,7 +115,11 @@ var (
 	lastCPUMetrics     CPUMetrics
 	lastGPUMetrics     GPUMetrics
 	lastNetDiskMetrics NetDiskMetrics
-	lastActiveLayout   string = "default"
+	// Latest Thunderbolt-network / RDMA values, buffered for setSensorGauges.
+	lastTBNetInBytesPerSec  float64
+	lastTBNetOutBytesPerSec float64
+	lastRDMAAvailable       bool
+	lastActiveLayout        string = "default"
 	// Per-process GPU time tracking
 	lastGPUProcessStats     map[int]uint64
 	lastGPUProcessStatsTime time.Time

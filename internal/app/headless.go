@@ -277,13 +277,48 @@ func printHeadlessSeparator(format string, count int, samplesCollected int) {
 
 func startHeadlessPrometheus() {
 	if prometheusPort != "" {
+		handler := promhttp.HandlerFor(buildSensorRegistry(), promhttp.HandlerOpts{})
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			if err := http.ListenAndServe(prometheusPort, nil); err != nil {
+			http.Handle("/metrics", handler)
+			if err := http.ListenAndServe(normalizeListenAddr(prometheusPort), nil); err != nil {
 				fmt.Fprintf(os.Stderr, i18n.T("Headless_ErrorPrometheusServer")+"\n", err)
 			}
 		}()
 	}
+}
+
+// updateHeadlessPrometheusMetrics builds a SensorSnapshot from one headless
+// sample and hands it to setSensorGauges — the same writer the TUI uses — so
+// both modes expose an identical mactop_* surface. The headless loop never runs
+// the TUI render path, so without this call the gauges would stay at zero.
+func updateHeadlessPrometheusMetrics(output HeadlessOutput) {
+	m := output.SocMetrics
+	setSensorGauges(SensorSnapshot{
+		CPUUsagePercent: output.CPUUsage,
+		CoreUsages:      output.CoreUsages,
+		CPU: CPUMetrics{
+			CPUW:           m.CPUPower,
+			GPUW:           m.GPUPower,
+			ANEW:           m.ANEPower,
+			DRAMW:          m.DRAMPower,
+			GPUSRAMW:       m.GPUSRAMPower,
+			SystemW:        m.SystemPower,
+			PackageW:       m.TotalPower,
+			CPUTemp:        float64(m.CPUTemp),
+			GPUTemp:        float64(m.GPUTemp),
+			DRAMReadBW:     m.DRAMReadBW,
+			DRAMWriteBW:    m.DRAMWriteBW,
+			DRAMBWCombined: m.DRAMBWCombined,
+			Fans:           m.Fans,
+			TempSensors:    m.TempSensors,
+		},
+		GPU:                 GPUMetrics{FreqMHz: output.GPUMetrics.FreqMHz, ActivePercent: output.GPUMetrics.ActivePercent},
+		Memory:              output.Memory,
+		TBNetInBytesPerSec:  output.TBNetTotalBytesInSec,
+		TBNetOutBytesPerSec: output.TBNetTotalBytesOutSec,
+		RDMAAvailable:       output.RDMAStatus.Available,
+		System:              output.SystemInfo,
+	})
 }
 
 func performHeadlessWarmup() *ThunderboltOutput {
@@ -304,6 +339,11 @@ func performHeadlessWarmup() *ThunderboltOutput {
 
 func processHeadlessSample(format string, tbInfo *ThunderboltOutput, sysInfo SystemInfo) error {
 	output := collectHeadlessData(tbInfo, sysInfo)
+
+	if prometheusPort != "" {
+		updateHeadlessPrometheusMetrics(output)
+	}
+
 	var data []byte
 	var err error
 
